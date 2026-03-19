@@ -1,0 +1,7 @@
+{
+  "reverts": [
+    {"pr": 34758, "reason": "Unguarded Hopper code breaks sm_121 build"},
+    {"pr": 34302, "reason": "Companion to #34758"}
+  ],
+  "applies": []
+}

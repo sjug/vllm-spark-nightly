@@ -1,0 +1,183 @@
+name: Nightly vLLM Wheel Build (DGX Spark)
+
+on:
+  schedule:
+    # Daily at 6:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      vllm_ref:
+        description: 'vLLM git ref (branch, tag, or SHA). Default: main'
+        required: false
+        default: 'main'
+      build_jobs:
+        description: 'Parallel build jobs'
+        required: false
+        default: '16'
+
+permissions:
+  contents: write
+
+env:
+  VLLM_REF: ${{ github.event.inputs.vllm_ref || 'main' }}
+  BUILD_JOBS: ${{ github.event.inputs.build_jobs || '16' }}
+  ROLLING_TAG: prebuilt-vllm-current
+
+jobs:
+  build:
+    runs-on: linux-arm64-16core
+    timeout-minutes: 120
+
+    steps:
+      # ── Free disk space ──────────────────────────────────
+      - name: Free disk space
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean || true
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      # ── Checkout ─────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Docker Buildx ───────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Resolve vLLM commit ─────────────────────────────
+      - name: Resolve vLLM commit hash
+        id: resolve
+        run: |
+          COMMIT=$(git ls-remote https://github.com/vllm-project/vllm.git "$VLLM_REF" | head -1 | cut -f1)
+          if [ -z "$COMMIT" ]; then
+            # Might be a SHA already
+            COMMIT="$VLLM_REF"
+          fi
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "short_commit=${COMMIT:0:10}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "Resolved vLLM ref '$VLLM_REF' -> $COMMIT"
+
+      # ── Check if already built ──────────────────────────
+      - name: Check if commit already built
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ROLLING_NAME=$(gh release view "$ROLLING_TAG" --json name -q .name 2>/dev/null || echo "")
+          if echo "$ROLLING_NAME" | grep -q "${{ steps.resolve.outputs.short_commit }}"; then
+            echo "Rolling release already contains commit ${{ steps.resolve.outputs.short_commit }} — skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Build wheels ────────────────────────────────────
+      - name: Build vLLM wheel
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: export
+          outputs: type=local,dest=./wheels
+          build-args: |
+            BUILD_JOBS=${{ env.BUILD_JOBS }}
+            VLLM_REF=${{ steps.resolve.outputs.commit }}
+            CACHEBUST_VLLM=${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Extract wheel metadata ──────────────────────────
+      - name: Extract wheel metadata
+        if: steps.check.outputs.skip != 'true'
+        id: meta
+        run: |
+          WHEEL=$(ls wheels/vllm-*.whl 2>/dev/null | head -1)
+          if [ -z "$WHEEL" ]; then
+            echo "::error::No vLLM wheel found in output"
+            exit 1
+          fi
+          WHEEL_NAME=$(basename "$WHEEL")
+          # Extract version string: vllm-<version>-cp...-linux_aarch64.whl
+          VERSION=$(echo "$WHEEL_NAME" | sed -E 's/^vllm-([^-]+)-.*/\1/')
+          echo "wheel_name=$WHEEL_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Built wheel: $WHEEL_NAME (version: $VERSION)"
+
+          # Read commit hash dumped during build
+          if [ -f wheels/.vllm-commit ]; then
+            BUILD_COMMIT=$(cat wheels/.vllm-commit)
+            echo "build_commit=$BUILD_COMMIT" >> "$GITHUB_OUTPUT"
+            echo "Build commit: $BUILD_COMMIT"
+          fi
+
+          # Collect patch summary if available
+          PATCH_NOTES=""
+          if [ -f /tmp/patches-applied.txt ] && [ -s /tmp/patches-applied.txt ]; then
+            PATCH_NOTES=$(cat /tmp/patches-applied.txt)
+          fi
+          # Write patch notes to a file for the release body
+          echo "$PATCH_NOTES" > /tmp/patch-notes.txt
+
+      # ── Create date-tagged release ──────────────────────
+      - name: Create date-tagged release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE_TAG="vllm-${{ steps.resolve.outputs.date }}"
+          RELEASE_NAME="Prebuilt vLLM Wheels (${{ steps.meta.outputs.version }}) - DGX Spark only"
+
+          BODY="## vLLM Nightly Build — ${{ steps.resolve.outputs.date }}
+
+          **Version:** \`${{ steps.meta.outputs.version }}\`
+          **Commit:** \`${{ steps.resolve.outputs.commit }}\`
+          **Architecture:** \`linux_aarch64\` (sm_121 / DGX Spark)
+          **Base image:** \`nvcr.io/nvidia/pytorch:26.01-py3\`
+
+          ### Patches Applied
+          \`\`\`
+          $(cat /tmp/patch-notes.txt 2>/dev/null || echo 'None')
+          \`\`\`
+
+          ### Usage
+          \`\`\`bash
+          pip install ${{ steps.meta.outputs.wheel_name }}
+          \`\`\`
+          "
+
+          # Delete existing release with same tag if re-running on same day
+          gh release delete "$DATE_TAG" --yes 2>/dev/null || true
+          gh release create "$DATE_TAG" \
+            --title "$RELEASE_NAME" \
+            --notes "$BODY" \
+            --prerelease \
+            wheels/vllm-*.whl
+
+      # ── Update rolling release ──────────────────────────
+      - name: Update rolling release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_NAME="Prebuilt vLLM Wheels (${{ steps.meta.outputs.version }}) - DGX Spark only"
+
+          # Delete existing rolling release and tag
+          gh release delete "$ROLLING_TAG" --yes 2>/dev/null || true
+          git push origin :"$ROLLING_TAG" 2>/dev/null || true
+
+          gh release create "$ROLLING_TAG" \
+            --title "$RELEASE_NAME" \
+            --notes "Rolling release — always points to the latest nightly build.
+
+          **Version:** \`${{ steps.meta.outputs.version }}\`
+          **Commit:** \`${{ steps.resolve.outputs.commit }}\`
+          **Date:** ${{ steps.resolve.outputs.date }}
+
+          See the date-tagged release \`vllm-${{ steps.resolve.outputs.date }}\` for full details." \
+            --prerelease \
+            wheels/vllm-*.whl
