@@ -18,6 +18,7 @@ RECIPE=""
 NOTES=""
 NO_WHEEL=false
 NO_LOG=false
+CONTAINER_RT=""
 EXTRA_ARGS=()
 
 usage() {
@@ -39,6 +40,7 @@ Options:
   --archive-dir <path>    Archive root (default: ~/benchmarks)
   --no-wheel              Skip archiving the wheel
   --no-log                Skip container log capture
+  --container-runtime <rt> Container runtime: podman or docker (default: auto-detect)
   --notes <text>          Free-text notes
   -h, --help              Show this help
 
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --archive-dir) ARCHIVE_DIR="$2"; shift 2 ;;
         --no-wheel)    NO_WHEEL=true; shift ;;
         --no-log)      NO_LOG=true; shift ;;
+        --container-runtime) CONTAINER_RT="$2"; shift 2 ;;
         --notes)       NOTES="$2"; shift 2 ;;
         -h|--help)     usage ;;
         --)            shift; EXTRA_ARGS=("$@"); break ;;
@@ -84,6 +87,17 @@ echo "  Depths: $DEPTHS"
 echo "  Runs:   $RUNS"
 echo "  Output: $RESULTS_FILE"
 echo ""
+
+# Activate llama-benchy venv if not already on PATH
+if ! command -v llama-benchy &>/dev/null; then
+    LLAMA_BENCHY_VENV="$HOME/git/llama-benchy/.venv/bin/activate"
+    if [[ -f "$LLAMA_BENCHY_VENV" ]]; then
+        source "$LLAMA_BENCHY_VENV"
+    else
+        echo "Error: llama-benchy not found. Install it or activate its venv." >&2
+        exit 1
+    fi
+fi
 
 # Run llama-benchy
 llama-benchy \
@@ -112,6 +126,7 @@ ARCHIVE_ARGS=(
 [[ -n "$NOTES" ]] && ARCHIVE_ARGS+=(--notes "$NOTES")
 [[ "$NO_WHEEL" == "true" ]] && ARCHIVE_ARGS+=(--no-wheel)
 [[ "$NO_LOG" == "true" ]] && ARCHIVE_ARGS+=(--no-log)
+[[ -n "$CONTAINER_RT" ]] && ARCHIVE_ARGS+=(--container-runtime "$CONTAINER_RT")
 
 "$SCRIPT_DIR/archive-benchmark.sh" "${ARCHIVE_ARGS[@]}"
 

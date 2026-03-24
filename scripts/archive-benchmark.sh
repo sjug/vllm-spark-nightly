@@ -13,6 +13,7 @@ RECIPE=""
 ARCHIVE_DIR="$HOME/benchmarks"
 ARCHIVE_WHEEL=true
 CAPTURE_LOG=true
+CONTAINER_RT=""
 NOTES=""
 DRY_RUN=false
 RESULTS_FILE=""
@@ -29,6 +30,7 @@ Options:
   --wheel-dir <path>      Where to find the .whl (default: ~/git/spark-vllm-docker/wheels/)
   --recipe <name>         Recipe name (default: auto-detect from model in results JSON)
   --archive-dir <path>    Archive root (default: ~/benchmarks)
+  --container-runtime <rt> Container runtime: podman or docker (default: auto-detect)
   --no-wheel              Skip archiving the wheel (metadata only)
   --no-log                Skip container log capture
   --notes <text>          Free-text notes
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --wheel-dir)   WHEEL_DIR="$2"; shift 2 ;;
         --recipe)      RECIPE="$2"; shift 2 ;;
         --archive-dir) ARCHIVE_DIR="$2"; shift 2 ;;
+        --container-runtime) CONTAINER_RT="$2"; shift 2 ;;
         --no-wheel)    ARCHIVE_WHEEL=false; shift ;;
         --no-log)      CAPTURE_LOG=false; shift ;;
         --notes)       NOTES="$2"; shift 2 ;;
@@ -131,8 +134,18 @@ WHEEL_VERSION=""
 WHEEL_COMMIT=""
 WHEEL_SHA256=""
 if [[ "$ARCHIVE_WHEEL" == "true" ]]; then
-    # Find the most recent .whl file
+    # Find the most recent vllm .whl — try locally first, then fetch from remote host
     WHEEL_FILE=$(find "$WHEEL_DIR" -maxdepth 1 -name "vllm-*.whl" -type f -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2)
+    if [[ -z "$WHEEL_FILE" ]]; then
+        REMOTE_WHEEL=$(ssh -o ConnectTimeout=5 "$HOST" \
+            "find '$WHEEL_DIR' -maxdepth 1 -name 'vllm-*.whl' -type f -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2" 2>/dev/null || true)
+        if [[ -n "$REMOTE_WHEEL" ]]; then
+            mkdir -p "$WHEEL_DIR"
+            scp "$HOST:$REMOTE_WHEEL" "$WHEEL_DIR/"
+            WHEEL_FILE="$WHEEL_DIR/$(basename "$REMOTE_WHEEL")"
+            echo "  Fetched wheel from $HOST:$REMOTE_WHEEL"
+        fi
+    fi
     if [[ -n "$WHEEL_FILE" ]]; then
         WHEEL_FILENAME="$(basename "$WHEEL_FILE")"
         # Extract version from wheel filename: vllm-<version>-<rest>.whl
@@ -141,7 +154,7 @@ if [[ "$ARCHIVE_WHEEL" == "true" ]]; then
         WHEEL_COMMIT=$(echo "$WHEEL_VERSION" | grep -oP '(?<=\+g)[0-9a-f]+' | head -1 || echo "")
         WHEEL_SHA256=$(sha256sum "$WHEEL_FILE" | cut -d' ' -f1)
     else
-        echo "Warning: no wheel found in $WHEEL_DIR" >&2
+        echo "Warning: no wheel found locally or on $HOST in $WHEEL_DIR" >&2
         ARCHIVE_WHEEL=false
     fi
 fi
@@ -193,8 +206,11 @@ echo "  Copied results.json"
 
 # 2. Capture container log
 if [[ "$CAPTURE_LOG" == "true" ]]; then
-    if ssh -o ConnectTimeout=5 "$HOST" "docker logs $CONTAINER" > /dev/null 2>&1; then
-        ssh "$HOST" "docker logs $CONTAINER 2>&1" | zstd -3 -q > "$RUN_DIR/container.log.zst"
+    if [[ -z "$CONTAINER_RT" ]]; then
+        CONTAINER_RT=$(ssh -o ConnectTimeout=5 "$HOST" "command -v podman >/dev/null 2>&1 && echo podman || echo docker" 2>/dev/null || echo podman)
+    fi
+    if ssh -o ConnectTimeout=5 "$HOST" "$CONTAINER_RT logs $CONTAINER" > /dev/null 2>&1; then
+        ssh "$HOST" "$CONTAINER_RT logs $CONTAINER 2>&1" | zstd -3 -q > "$RUN_DIR/container.log.zst"
         echo "  Captured container log ($(du -h "$RUN_DIR/container.log.zst" | cut -f1))"
     else
         echo "  Warning: could not capture container log from $HOST:$CONTAINER" >&2
